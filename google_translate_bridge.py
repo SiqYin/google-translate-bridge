@@ -22,6 +22,7 @@ Google Translation API，费用走你 Google Cloud 的 $300 赠金。
 
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -88,6 +89,17 @@ def log(msg):
     print("[%s] %s" % (time.strftime("%H:%M:%S"), msg), flush=True)
 
 
+def dump_request(messages):
+    """把收到的原始 messages 追加到日志，便于排查 prompt 格式。"""
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "request_dump.log")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("=== %s ===\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+            f.write(json.dumps(messages, ensure_ascii=False, indent=2) + "\n")
+    except Exception:
+        pass
+
+
 def normalize_lang(name):
     """把语言名或代码统一成 Google 语言代码。"""
     if not name:
@@ -101,13 +113,29 @@ def normalize_lang(name):
     return TARGET_LANG
 
 
+# 预编译：用已知语言名做精确匹配，避免把 "日语：正文" 整串误当语言名
+_LANG_ALTERNATES = "|".join(
+    sorted((re.escape(k) for k in LANG_NAME_TO_CODE.keys()), key=len, reverse=True)
+)
+# 指令头：中英文翻译指令 + 精确语言名 + 可选的括号说明 + 冒号
+# 例: "Translate to Chinese (Simplified):" / "请翻译成日语：" / "翻译为 English:"
+_INSTR_HEAD = re.compile(
+    r"^\s*(?:translate\s+(?:to|into)\s+|translate\s+the\s+following[^\n:：]{0,40}?to\s+|"
+    r"请(?:将以下内容)?翻译(?:成|为)\s*|翻译(?:成|为)\s*)"
+    r"(" + _LANG_ALTERNATES + r")"
+    r"\s*(?:\([^)]{0,30}\)|（[^）]{0,30}）)?\s*[:：]?\s*",
+    re.IGNORECASE,
+)
+# 整行都是指令（语言名后无正文），例如 "Translate to Japanese"
+_INSTR_LINE_ONLY = re.compile(
+    r"^\s*(?:translate\s+(?:to|into)|请(?:将以下内容)?翻译(?:成|为)|翻译(?:成|为))\s+"
+    r"(?:" + _LANG_ALTERNATES + r")\s*[:：]?\s*$",
+    re.IGNORECASE,
+)
+
+
 def detect_target_lang(messages):
-    """
-    从 system / user prompt 中解析目标语言。
-    沉浸式翻译默认 prompt: "Translate to {{to}} (output translation only):"
-    找不到则用环境变量 TARGET_LANG。
-    """
-    import re
+    """从 prompt 中精确解析目标语言；识别不到则用 TARGET_LANG。"""
     blob = ""
     for m in messages:
         c = m.get("content")
@@ -117,24 +145,23 @@ def detect_target_lang(messages):
             for b in c:
                 if isinstance(b, dict) and isinstance(b.get("text"), str):
                     blob += b["text"] + "\n"
-    # 匹配 "Translate to Chinese (Simplified):" / "translate into Japanese" / "翻译为日语"
-    m = re.search(
-        r"(?:translate\s+(?:to|into)|translate\s+the\s+following[^\n]*?to|"
-        r"翻译为|翻译成|翻译为)\s*[:：]?\s*([A-Za-z\u4e00-\u9fff()（）\- ]{2,30})\s*[:：]?",
-        blob, re.IGNORECASE,
-    )
+    # 优先在整段里找指令头（覆盖指令独占一行、或与正文同行的情况）
+    m = _INSTR_HEAD.search(blob)
     if m:
-        raw = m.group(1).strip().rstrip(":：").strip()
-        return normalize_lang(raw)
+        lang = normalize_lang(m.group(1))
+        if lang != TARGET_LANG:
+            return lang
+    # 兜底：任意位置出现已知语言名（如 system prompt 里的 "professional Chinese native translator"）
+    for name, code in LANG_NAME_TO_CODE.items():
+        if re.search(r"(?<![a-z])" + re.escape(name) + r"(?![a-z])", blob, re.IGNORECASE):
+            return code
     return TARGET_LANG
 
 
 def extract_text(messages):
     """
-    从 OpenAI / Anthropic messages 中提取真正要翻译的文本。
-    规则: 取最后一条 user 消息的 content，剥离翻译指令前缀行，
-    保留 %% 多段落分隔符（沉浸式翻译靠它还原分段）。
-    返回 (文本, 是否HTML, 段落数)
+    提取真正要翻译的文本：剥离「指令 + 语言名 + 冒号」前缀（同行或独占行均可），
+    保留 %% 多段落分隔。返回 (文本, 是否HTML, 段落数)
     """
     raw = ""
     for m in reversed(messages):
@@ -156,20 +183,24 @@ def extract_text(messages):
 
     is_html = "<" in raw and ">" in raw
 
-    # 按行剥离指令前缀（只处理开头几行，不误伤正文）
     lines = raw.split("\n")
     cleaned = []
     for i, line in enumerate(lines):
-        if i < 4 and line.strip().lower().startswith(INSTRUCTION_PREFIXES):
-            continue
+        if i < 6:
+            m = _INSTR_HEAD.match(line)
+            if m:
+                remainder = line[m.end():]
+                if remainder.strip():
+                    cleaned.append(remainder.lstrip())
+                continue
+            if _INSTR_LINE_ONLY.match(line):
+                continue
         cleaned.append(line)
-    text = "\n".join(cleaned).strip()
 
-    # 去掉每行末尾可能残留的冒号指令
+    text = "\n".join(cleaned).strip()
     if not text:
         text = raw.strip()
 
-    # 识别 %% 多段落分隔
     parts = [p for p in text.split("%%")]
     return text, is_html, len(parts)
 
