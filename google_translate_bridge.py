@@ -59,7 +59,7 @@ LANG_NAME_TO_CODE = {
     "chinese (traditional)": "zh-TW", "traditional chinese": "zh-TW",
     "繁體中文": "zh-TW", "zh-tw": "zh-TW",
     "english": "en", "英语": "en", "英文": "en", "en-us": "en", "en": "en",
-    "japanese": "ja", "日语": "ja", "日文": "ja", "ja": "ja",
+    "japanese": "ja", "日语": "ja", "日文": "ja", "日本語": "ja", "ja": "ja",
     "korean": "ko", "韩语": "ko", "韩文": "ko", "ko": "ko",
     "french": "fr", "法语": "fr", "fr": "fr",
     "german": "de", "德语": "de", "de": "de",
@@ -117,7 +117,15 @@ def normalize_lang(name):
 _LANG_ALTERNATES = "|".join(
     sorted((re.escape(k) for k in LANG_NAME_TO_CODE.keys()), key=len, reverse=True)
 )
-# 指令头：中英文翻译指令 + 精确语言名 + 可选的括号说明 + 冒号
+# 指令头（语言名在前，指令在后）—— 日语/韩语等 SOV 语序
+# 例: "日本語に翻訳してください：" / "日本語に訳してください：" / "中国語に翻訳してください"
+_JP_INSTR_HEAD = re.compile(
+    r"^\s*(" + _LANG_ALTERNATES + r")"
+    r"\s*(?:に|へ)\s*(?:翻訳|訳)\s*し?て\s*(?:ください|ください。|くれ)?"
+    r"\s*[:：]?\s*",
+    re.IGNORECASE,
+)
+# 指令头（指令在前，语言名在后）—— 中英文 SVO 语序
 # 例: "Translate to Chinese (Simplified):" / "请翻译成日语：" / "翻译为 English:"
 _INSTR_HEAD = re.compile(
     r"^\s*(?:translate\s+(?:to|into)\s+|translate\s+the\s+following[^\n:：]{0,40}?to\s+|"
@@ -126,10 +134,12 @@ _INSTR_HEAD = re.compile(
     r"\s*(?:\([^)]{0,30}\)|（[^）]{0,30}）)?\s*[:：]?\s*",
     re.IGNORECASE,
 )
-# 整行都是指令（语言名后无正文），例如 "Translate to Japanese"
+# 整行都是指令（语言名后无正文），例如 "Translate to Japanese" / "日本語に翻訳してください"
 _INSTR_LINE_ONLY = re.compile(
-    r"^\s*(?:translate\s+(?:to|into)|请(?:将以下内容)?翻译(?:成|为)|翻译(?:成|为))\s+"
-    r"(?:" + _LANG_ALTERNATES + r")\s*[:：]?\s*$",
+    r"^\s*(?:(?:translate\s+(?:to|into)|请(?:将以下内容)?翻译(?:成|为)|翻译(?:成|为))\s+"
+    r"(?:" + _LANG_ALTERNATES + r")|"
+    r"(?:" + _LANG_ALTERNATES + r")\s*(?:に|へ)\s*(?:翻訳|訳)\s*し?て\s*(?:ください)?)"
+    r"\s*[:：]?\s*$",
     re.IGNORECASE,
 )
 
@@ -146,12 +156,19 @@ def detect_target_lang(messages):
                 if isinstance(b, dict) and isinstance(b.get("text"), str):
                     blob += b["text"] + "\n"
     # 优先在整段里找指令头（覆盖指令独占一行、或与正文同行的情况）
+    # 日语语序: "日本語に翻訳してください："
+    m = _JP_INSTR_HEAD.search(blob)
+    if m:
+        lang = normalize_lang(m.group(1))
+        if lang != TARGET_LANG:
+            return lang
+    # 中英文语序: "Translate to Japanese:" / "请翻译成日语："
     m = _INSTR_HEAD.search(blob)
     if m:
         lang = normalize_lang(m.group(1))
         if lang != TARGET_LANG:
             return lang
-    # 兜底：任意位置出现已知语言名（如 system prompt 里的 "professional Chinese native translator"）
+    # 兜底：任意位置出现已知语言名（如 system prompt 里的 "プロの日本語ネイティブ翻訳者"）
     for name, code in LANG_NAME_TO_CODE.items():
         if re.search(r"(?<![a-z])" + re.escape(name) + r"(?![a-z])", blob, re.IGNORECASE):
             return code
@@ -187,7 +204,9 @@ def extract_text(messages):
     cleaned = []
     for i, line in enumerate(lines):
         if i < 6:
-            m = _INSTR_HEAD.match(line)
+            m = _JP_INSTR_HEAD.match(line)
+            if not m:
+                m = _INSTR_HEAD.match(line)
             if m:
                 remainder = line[m.end():]
                 if remainder.strip():
@@ -257,8 +276,10 @@ def google_translate(texts, target, is_html):
 
 def do_translation(messages):
     """核心流程：提取 -> 翻译 -> 统计。返回 (译文, 目标语言, 段落数)。"""
+    dump_request(messages)
     text, is_html, n_parts = extract_text(messages)
     target = detect_target_lang(messages)
+    log("提取文本=%r 目标语言=%s" % (text[:80], target))
     parts = text.split("%%") if n_parts > 1 else [text]
 
     translated = google_translate(parts, target, is_html)
